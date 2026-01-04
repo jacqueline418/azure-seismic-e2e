@@ -70,6 +70,14 @@ jobs:
         run: |
           unzip release.zip
           rm release.zip
+      
+      - name: Debug - list extracted structure
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          echo "---- find host.json / requirements.txt ----"
+          find . -maxdepth 3 -name host.json -o -name requirements.txt -o -name function_app.py
+
         
       - name: Login to Azure
         uses: azure/login@v2
@@ -87,4 +95,5 @@ jobs:
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
 
           
+
 
