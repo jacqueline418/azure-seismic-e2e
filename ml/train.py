@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from collections import Counter
 from typing import Optional, List
+from datetime import datetime, timezone, timedelta
 
 import joblib
 import pandas as pd
@@ -82,6 +83,35 @@ def load_jsonl_from_adls(conn_str: str, container: str, prefix: str, max_blobs: 
     log(f"Loaded {len(rows):,} JSON rows from {len(blobs)} blobs in {time.time() - t0:.2f}s")
     return pd.DataFrame(rows)
 
+def find_latest_hour_prefix(conn_str: str, container: str, base_prefix: str, lookback_hours: int = 48) -> str:
+    """
+    Find the most recent hour-partition folder that has at least 1 blob.
+    Assumes your ASA path pattern is: <base_prefix>/{date}/{time}
+    where date format is YYYY/MM/DD and time format is HH.
+    So the generated folder is: raw/YYYY/MM/DD/HH/
+    """
+    base_prefix = _normalize_prefix(base_prefix)
+
+    bsc = BlobServiceClient.from_connection_string(conn_str)
+    cc = bsc.get_container_client(container)
+
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+    for i in range(0, lookback_hours + 1):
+        dt = now - timedelta(hours=i)
+        prefix = f"{base_prefix}{dt.strftime('%Y/%m/%d/%H')}/"
+
+        # Try to see if there is at least 1 blob under this prefix
+        it = cc.list_blobs(name_starts_with=prefix)
+        try:
+            next(it)
+            return prefix
+        except StopIteration:
+            continue
+
+    raise FileNotFoundError(
+        f"Could not find any blobs under {container}/{base_prefix} in the last {lookback_hours} hours."
+    )
 
 def apply_report_encoding(df: pd.DataFrame) -> pd.DataFrame:
     # Enforce required columns exist
@@ -121,7 +151,6 @@ def apply_report_encoding(df: pd.DataFrame) -> pd.DataFrame:
 def main():
     load_dotenv()  # reads ml/.env if present
 
-    # ---- env ----
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
     if not conn_str:
         raise RuntimeError(
@@ -129,9 +158,23 @@ def main():
             "Set it via export or put it in ml/.env (do NOT commit secrets)."
         )
 
+    # ASA output container (where your RawOutput writes)
     container = os.getenv("ASA_CONTAINER", "stream-output")
-    prefix = os.getenv("ASA_PREFIX", "raw/2026/01/04/20/")
-    prefix = _normalize_prefix(prefix)
+
+    # Root prefix for full raw output (NOT alerts)
+    base_prefix = os.getenv("ASA_BASE_PREFIX", "raw/")
+
+    lookback_hours = int(os.getenv("ASA_LOOKBACK_HOURS", "48"))
+
+    # If you still set ASA_PREFIX manually, we respect it; otherwise auto-pick latest.
+    prefix = os.getenv("ASA_PREFIX", "").strip()
+    if prefix:
+        prefix = _normalize_prefix(prefix)
+        log(f"Using explicit ASA_PREFIX={prefix}")
+    else:
+        log(f"Auto-detecting latest hour under base prefix '{base_prefix}' (lookback {lookback_hours}h)...")
+        prefix = find_latest_hour_prefix(conn_str, container, base_prefix, lookback_hours=lookback_hours)
+        log(f"Detected latest raw prefix: {prefix}")
 
     out_model = os.getenv("MODEL_OUT", "ml/model.joblib")
     out_meta = os.getenv("MODEL_META_OUT", "ml/model_meta.json")
@@ -165,7 +208,6 @@ def main():
     X = df[CATEGORICAL + NUMERIC].astype(float)
     y = df[LABEL].astype(int)
 
-    # 3) Build report-aligned pipeline: SMOTE -> StandardScaler -> RF(best params)
     log("Building pipeline: SMOTE -> StandardScaler -> RandomForest(best params)")
     pipe = ImbPipeline(steps=[
         ("smote", SMOTE(k_neighbors=5, random_state=seed)),
@@ -180,7 +222,6 @@ def main():
         ))
     ])
 
-    # 4) Split + Fit
     log("Splitting train/test...")
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=seed, stratify=y
@@ -192,7 +233,6 @@ def main():
     pipe.fit(X_train, y_train)
     log(f"Fit complete in {time.time() - t_fit:.2f}s ✅")
 
-    # 5) Evaluate
     log("Evaluating on test set...")
     y_pred = pipe.predict(X_test)
 
@@ -204,7 +244,6 @@ def main():
         auc = roc_auc_score(y_test, y_prob)
         log(f"ROC-AUC: {auc:.6f}")
 
-    # 6) Save model + meta
     os.makedirs(os.path.dirname(out_model), exist_ok=True)
     joblib.dump(pipe, out_model)
     log(f"Saved model pipeline to: {out_model}")
@@ -215,10 +254,7 @@ def main():
         "prefix": prefix,
         "features": CATEGORICAL + NUMERIC,
         "label": LABEL,
-        "encoding": {
-            "MAP_ABCD": MAP_ABCD,
-            "MAP_SHIFT": MAP_SHIFT
-        },
+        "encoding": {"MAP_ABCD": MAP_ABCD, "MAP_SHIFT": MAP_SHIFT},
         "pipeline_order": ["SMOTE", "StandardScaler", "RandomForest"],
         "rf_params": {
             "n_estimators": 200,

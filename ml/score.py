@@ -1,15 +1,16 @@
-# # ml/score.py
+# ml/score.py
 import os
 import io
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import joblib
 import pandas as pd
 from dotenv import load_dotenv
 from azure.storage.blob import BlobServiceClient
+
 
 # Must match train.py
 CATEGORICAL = ["seismic", "seismoacoustic", "shift", "ghazard"]
@@ -31,7 +32,7 @@ def log(msg: str) -> None:
 
 
 def _normalize_prefix(prefix: str) -> str:
-    prefix = prefix.strip()
+    prefix = (prefix or "").strip()
     if prefix and not prefix.endswith("/"):
         prefix += "/"
     return prefix
@@ -70,7 +71,6 @@ def load_jsonl_from_adls(conn_str: str, container: str, prefix: str, max_blobs: 
 
 
 def apply_report_encoding_for_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure features exist
     missing = [c for c in FEATURES if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required feature columns: {missing}")
@@ -105,6 +105,35 @@ def upload_csv_to_adls(conn_str: str, container: str, blob_name: str, df: pd.Dat
     cc.upload_blob(name=blob_name, data=data, overwrite=True)
 
 
+def find_latest_hour_prefix(conn_str: str, container: str, base_prefix: str, lookback_hours: int = 48) -> str:
+    """
+    Find the most recent hour-partition folder that has at least 1 blob.
+    Assumes ASA path pattern: <base_prefix>/{date}/{time}
+    => raw/YYYY/MM/DD/HH/
+    """
+    base_prefix = _normalize_prefix(base_prefix)
+
+    bsc = BlobServiceClient.from_connection_string(conn_str)
+    cc = bsc.get_container_client(container)
+
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+    for i in range(0, lookback_hours + 1):
+        dt = now - timedelta(hours=i)
+        prefix = f"{base_prefix}{dt.strftime('%Y/%m/%d/%H')}/"
+
+        it = cc.list_blobs(name_starts_with=prefix)
+        try:
+            next(it)
+            return prefix
+        except StopIteration:
+            continue
+
+    raise FileNotFoundError(
+        f"Could not find any blobs under {container}/{base_prefix} in the last {lookback_hours} hours."
+    )
+
+
 def main():
     load_dotenv()
 
@@ -115,18 +144,41 @@ def main():
             "Set it via export or put it in ml/.env (do NOT commit secrets)."
         )
 
+    # ---- INPUT: Raw ASA output container/prefix ----
     in_container = os.getenv("ASA_CONTAINER", "stream-output")
-    in_prefix = _normalize_prefix(os.getenv("ASA_PREFIX", "raw/2026/01/04/20/"))
+    base_prefix = os.getenv("ASA_BASE_PREFIX", "raw/")
+    lookback_hours = int(os.getenv("ASA_LOOKBACK_HOURS", "48"))
 
+    # optional override (manual)
+    in_prefix = os.getenv("ASA_PREFIX", "").strip()
+    if in_prefix:
+        in_prefix = _normalize_prefix(in_prefix)
+        log(f"Using explicit ASA_PREFIX={in_prefix}")
+    else:
+        log(f"Auto-detecting latest hour under '{base_prefix}' (lookback {lookback_hours}h)...")
+        in_prefix = find_latest_hour_prefix(conn_str, in_container, base_prefix, lookback_hours=lookback_hours)
+        log(f"Detected latest raw prefix: {in_prefix}")
+
+    # ---- MODEL ----
     model_path = os.getenv("MODEL_PATH", "ml/model.joblib")
 
-    # Output location
-    out_container = os.getenv("PRED_CONTAINER", in_container)
+    # ---- OUTPUT: predictions go to their own container ----
+    out_container = os.getenv("PRED_CONTAINER", "predictions")
 
-    # default: predictions/<same prefix>
-    # e.g. predictions/raw/2026/01/04/20/
-    out_prefix = os.getenv("PRED_PREFIX", f"predictions/{in_prefix}")
-    out_prefix = _normalize_prefix(out_prefix)
+    # make output paths clean (not nested under "predictions/" inside stream-output)
+    # We'll mirror the hour folder and write: raw_scored/YYYY/MM/DD/HH/preds_xxx.csv
+    pred_base = os.getenv("PRED_BASE_PREFIX", "raw_scored/")
+    pred_base = _normalize_prefix(pred_base)
+
+    # derive hour folder from in_prefix like raw/YYYY/MM/DD/HH/
+    # strip base_prefix from in_prefix if possible
+    hour_suffix = in_prefix
+    norm_base = _normalize_prefix(base_prefix)
+    if hour_suffix.startswith(norm_base):
+        hour_suffix = hour_suffix[len(norm_base):]  # -> YYYY/MM/DD/HH/
+    hour_suffix = _normalize_prefix(hour_suffix)
+
+    out_prefix = _normalize_prefix(os.getenv("PRED_PREFIX", f"{pred_base}{hour_suffix}"))
 
     threshold = float(os.getenv("PRED_THRESHOLD", "0.20"))
 
@@ -143,11 +195,11 @@ def main():
     if max_blobs is not None:
         log(f"MAX_SCORE_BLOBS  = {max_blobs}")
 
-    # 1) Load new stream rows
+    # 1) Load latest raw rows
     raw_df = load_jsonl_from_adls(conn_str, in_container, in_prefix, max_blobs=max_blobs)
     log(f"DataFrame shape (raw): {raw_df.shape}")
 
-    # 2) Encode features exactly like report
+    # 2) Encode features like report
     encoded = apply_report_encoding_for_features(raw_df)
     X = encoded[FEATURES].astype(float)
 
@@ -155,17 +207,14 @@ def main():
     before = len(X)
     mask_valid = X.notna().all(axis=1)
     X = X[mask_valid]
-    kept = len(X)
-    dropped = before - kept
+    dropped = before - len(X)
     if dropped > 0:
         log(f"Dropped {dropped} rows due to NaNs after coercion/encoding.")
 
-    # Keep aligned original rows for output
     out_rows = raw_df.loc[X.index].copy()
 
-    # 3) Load model + predict probabilities
+    # 3) Load model + predict
     pipe = joblib.load(model_path)
-
     if not hasattr(pipe, "predict_proba"):
         raise RuntimeError("Loaded model does not support predict_proba. Expected RF pipeline.")
 
@@ -181,7 +230,7 @@ def main():
     log(f"Predicted positives @ threshold={threshold}: {pos}/{len(y_pred)}")
     log(f"Prob stats: min={float(y_prob.min()):.4f}, mean={float(y_prob.mean()):.4f}, max={float(y_prob.max()):.4f}")
 
-    # Optional quick eval if ground-truth exists in the stream (for your demo/replay)
+    # Optional quick eval if class exists (for replay/demo)
     if LABEL in out_rows.columns:
         try:
             y_true = pd.to_numeric(out_rows[LABEL], errors="coerce").astype("Int64")
@@ -193,7 +242,7 @@ def main():
         except Exception as e:
             log(f"Skipped quick eval due to error: {e}")
 
-    # 4) Write predictions CSV back to ADLS
+    # 4) Write predictions CSV
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out_name = f"{out_prefix}preds_{ts}.csv"
 

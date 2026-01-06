@@ -1,7 +1,7 @@
 {
-  "trained_at_utc": "2026-01-04T21:07:12.293845+00:00",
+  "trained_at_utc": "2026-01-06T03:01:43.712701+00:00",
   "container": "stream-output",
-  "prefix": "raw/2026/01/04/20/",
+  "prefix": "raw/2026/01/06/02/",
   "features": [
     "seismic",
     "seismoacoustic",
