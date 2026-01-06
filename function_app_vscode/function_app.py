@@ -72,7 +72,8 @@ def _clean_row(row: dict) -> dict:
         out[k] = _to_number_if_possible(v)
     return out
 
-@app.route(route="replay", methods=["GET", "POST"])
+@app.function_name(name="replay")
+@app.route(route="replay", methods=["GET", "POST"], auth_level=func.AuthLevel.FUNCTION)
 def replay(req: func.HttpRequest) -> func.HttpResponse:
     """
     HTTP trigger:
