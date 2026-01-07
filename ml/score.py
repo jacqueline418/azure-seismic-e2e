@@ -145,15 +145,15 @@ def main():
         )
 
     # ---- INPUT: Raw ASA output container/prefix ----
-    in_container = os.getenv("ASA_CONTAINER", "stream-output")
-    base_prefix = os.getenv("ASA_BASE_PREFIX", "raw/")
+    in_container = os.getenv("IN_CONTAINER", "stream-output")
+    base_prefix = os.getenv("RAW_ROOT_PREFIX", "raw/")
     lookback_hours = int(os.getenv("ASA_LOOKBACK_HOURS", "48"))
 
     # optional override (manual)
-    in_prefix = os.getenv("ASA_PREFIX", "").strip()
+    in_prefix = os.getenv("RAW_ROOT_PREFIX", "").strip()
     if in_prefix:
         in_prefix = _normalize_prefix(in_prefix)
-        log(f"Using explicit ASA_PREFIX={in_prefix}")
+        log(f"Using explicit RAW_ROOT_PREFIX={in_prefix}")
     else:
         log(f"Auto-detecting latest hour under '{base_prefix}' (lookback {lookback_hours}h)...")
         in_prefix = find_latest_hour_prefix(conn_str, in_container, base_prefix, lookback_hours=lookback_hours)
@@ -163,11 +163,11 @@ def main():
     model_path = os.getenv("MODEL_PATH", "ml/model.joblib")
 
     # ---- OUTPUT: predictions go to their own container ----
-    out_container = os.getenv("PRED_CONTAINER", "predictions")
+    out_container = os.getenv("OUT_CONTAINER", "predictions")
 
     # make output paths clean (not nested under "predictions/" inside stream-output)
     # We'll mirror the hour folder and write: raw_scored/YYYY/MM/DD/HH/preds_xxx.csv
-    pred_base = os.getenv("PRED_BASE_PREFIX", "raw_scored/")
+    pred_base = os.getenv("OUT_ROOT_PREFIX", "scores/")
     pred_base = _normalize_prefix(pred_base)
 
     # derive hour folder from in_prefix like raw/YYYY/MM/DD/HH/

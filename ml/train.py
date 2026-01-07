@@ -166,11 +166,11 @@ def main():
 
     lookback_hours = int(os.getenv("ASA_LOOKBACK_HOURS", "48"))
 
-    # If you still set ASA_PREFIX manually, we respect it; otherwise auto-pick latest.
-    prefix = os.getenv("ASA_PREFIX", "").strip()
+    # If you still set RAW_ROOT_PREFIX manually, we respect it; otherwise auto-pick latest.
+    prefix = os.getenv("RAW_ROOT_PREFIX", "").strip()
     if prefix:
         prefix = _normalize_prefix(prefix)
-        log(f"Using explicit ASA_PREFIX={prefix}")
+        log(f"Using explicit RAW_ROOT_PREFIX={prefix}")
     else:
         log(f"Auto-detecting latest hour under base prefix '{base_prefix}' (lookback {lookback_hours}h)...")
         prefix = find_latest_hour_prefix(conn_str, container, base_prefix, lookback_hours=lookback_hours)
@@ -186,8 +186,8 @@ def main():
     seed = int(os.getenv("SEED", "42"))
 
     log("=== Training started (Report-aligned) ===")
-    log(f"ASA_CONTAINER   = {container}")
-    log(f"ASA_PREFIX      = {prefix}")
+    log(f"IN_CONTAINER   = {container}")
+    log(f"RAW_ROOT_PREFIX      = {prefix}")
     log(f"MODEL_OUT       = {out_model}")
     if max_blobs is not None:
         log(f"MAX_TRAIN_BLOBS = {max_blobs}")

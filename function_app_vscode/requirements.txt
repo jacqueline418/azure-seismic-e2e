@@ -5,3 +5,18 @@
 azure-functions
 azure-storage-blob
 azure-eventhub
+
+# ml/requirements.txt
+pandas==2.2.3
+numpy==2.1.3
+
+scikit-learn==1.5.2
+joblib==1.4.2
+
+# Optional but common for imbalanced classification (SMOTE)
+imbalanced-learn==0.12.4
+
+# If scoring reads/writes directly to ADLS (Blob Storage)
+azure-storage-blob
+
+python-dotenv==1.0.1
