@@ -364,11 +364,19 @@ def score(req: func.HttpRequest) -> func.HttpResponse:
         out_rows["threshold"] = threshold
         out_rows["scored_at_utc"] = _now_utc_iso()
 
-        # Write predictions
+        # Write predictions (timestamped + stable latest.csv)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_root = _normalize_prefix(out_root)
         chosen_prefix_norm = _normalize_prefix(chosen_prefix)
+
+        # 1) Timestamped history file (keep your current structure)
         out_blob = f"{out_root}{chosen_prefix_norm}preds_{ts}.csv".replace("//", "/")
+        _upload_csv(bsc, out_container, out_blob, out_rows)
+
+        # 2) Stable file for Power BI refresh (overwrite each run)
+        latest_blob = f"{out_root}latest.csv".replace("//", "/")
+        _upload_csv(bsc, out_container, latest_blob, out_rows)
+
 
         _upload_csv(bsc, out_container, out_blob, out_rows)
 
@@ -399,6 +407,7 @@ def score(req: func.HttpRequest) -> func.HttpResponse:
             "output": {
                 "container": out_container,
                 "blob": out_blob,
+                "latest": latest_blob,
             },
             "timing": {
                 "elapsed_sec": round(time.time() - t0, 4),
