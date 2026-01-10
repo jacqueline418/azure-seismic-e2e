@@ -7,7 +7,7 @@ import csv
 import io
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-
+import numpy as np
 import azure.functions as func
 
 from azure.storage.blob import BlobClient, BlobServiceClient
@@ -17,7 +17,7 @@ import pandas as pd
 import joblib
 
 # Only needed if you want eval metrics in HTTP response
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score,confusion_matrix
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -195,6 +195,40 @@ def _upload_csv(bsc: BlobServiceClient, container: str, blob_name: str, df: pd.D
     data = buf.getvalue().encode("utf-8")
     bsc.get_blob_client(container=container, blob=blob_name).upload_blob(data, overwrite=True)
 
+def _json_safe(v: Any) -> Any:
+    """Make values JSON serializable (timestamps, numpy types, etc.)."""
+    if v is None:
+        return None
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, (datetime,)):
+        return v.isoformat()
+    # pandas timestamps
+    try:
+        import pandas as _pd
+        if isinstance(v, (_pd.Timestamp,)):
+            return v.isoformat()
+    except Exception:
+        pass
+    # numpy scalars
+    try:
+        if isinstance(v, (np.generic,)):
+            return v.item()
+    except Exception:
+        pass
+    return str(v)
+
+def _get_blob_meta(bsc: BlobServiceClient, container: str, blob: str) -> Dict[str, Any]:
+    """Fetch basic blob metadata for reproducibility (etag, last_modified...)."""
+    bc = bsc.get_blob_client(container=container, blob=blob)
+    props = bc.get_blob_properties()
+    return {
+        "container": container,
+        "blob": blob,
+        "etag": getattr(props, "etag", None),
+        "last_modified": _json_safe(getattr(props, "last_modified", None)),
+        "size_bytes": getattr(props, "size", None),
+    }
 
 # ----------------------------
 # HTTP: replay (unchanged)
@@ -364,7 +398,7 @@ def score(req: func.HttpRequest) -> func.HttpResponse:
         out_rows["threshold"] = threshold
         out_rows["scored_at_utc"] = _now_utc_iso()
 
-        # Write predictions (timestamped + stable latest.csv)
+                # Write predictions (timestamped + stable latest.csv)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_root = _normalize_prefix(out_root)
         chosen_prefix_norm = _normalize_prefix(chosen_prefix)
@@ -373,12 +407,9 @@ def score(req: func.HttpRequest) -> func.HttpResponse:
         out_blob = f"{out_root}{chosen_prefix_norm}preds_{ts}.csv".replace("//", "/")
         _upload_csv(bsc, out_container, out_blob, out_rows)
 
-        # 2) Stable file for Power BI refresh (overwrite each run)
+        # 2) Stable file for refresh (overwrite each run)
         latest_blob = f"{out_root}latest.csv".replace("//", "/")
         _upload_csv(bsc, out_container, latest_blob, out_rows)
-
-
-        _upload_csv(bsc, out_container, out_blob, out_rows)
 
         # Build report-aligned HTTP response
         resp: Dict[str, Any] = {
@@ -428,18 +459,133 @@ def score(req: func.HttpRequest) -> func.HttpResponse:
                     )
                     auc = roc_auc_score(y_true.astype(int), y_prob)
 
-                    resp["eval"] = {
-                        "roc_auc": float(auc),
-                        "accuracy": float(report["accuracy"]),
-                        "positive_class_1": {
-                            "precision": float(report["1"]["precision"]),
-                            "recall": float(report["1"]["recall"]),
-                            "f1": float(report["1"]["f1-score"]),
-                            "support": int(report["1"]["support"]),
-                        },
-                        "macro_avg_f1": float(report["macro avg"]["f1-score"]),
-                        "weighted_avg_f1": float(report["weighted avg"]["f1-score"]),
+                                        # ---- distribution helpers ----
+                    y_prob_s = pd.Series(y_prob)
+
+                    # histogram buckets (0.00-0.05, ..., 0.95-1.00)
+                    bin_edges = np.linspace(0.0, 1.0, 21)
+                    counts, edges = np.histogram(y_prob, bins=bin_edges)
+                    prob_hist = [
+                        {
+                            "bin_start": float(edges[i]),
+                            "bin_end": float(edges[i + 1]),
+                            "count": int(counts[i]),
+                        }
+                        for i in range(len(counts))
+                    ]
+
+                    prob_quantiles = {
+                        "p50": float(y_prob_s.quantile(0.50)),
+                        "p90": float(y_prob_s.quantile(0.90)),
+                        "p95": float(y_prob_s.quantile(0.95)),
+                        "p99": float(y_prob_s.quantile(0.99)),
                     }
+
+                    # top-k highest risk row preview
+                    preview_cols = [
+                        "y_prob", "y_pred", LABEL,
+                        "maxenergy", "energy", "shift", "ghazard",
+                        "EventEnqueuedUtcTime", "EventProcessedUtcTime",
+                    ]
+                    preview_cols = [c for c in preview_cols if c in out_rows.columns]
+
+                    top_k = int(req.params.get("topk", "20"))
+                    top_k = max(0, min(top_k, 200))  # safety cap
+                    top_rows_df = out_rows.sort_values("y_prob", ascending=False).head(top_k)
+
+                    top_rows = []
+                    for _, r in top_rows_df[preview_cols].iterrows():
+                        item = {k: _json_safe(r[k]) for k in preview_cols}
+                        top_rows.append(item)
+
+                    # Model metadata for reproducibility
+                    model_meta = _get_blob_meta(bsc, model_container, model_blob)
+
+                    # Build HTTP response
+                    scored_at = out_rows["scored_at_utc"].iloc[0] if len(out_rows) else _now_utc_iso()
+                    predicted_positive = int((y_pred == 1).sum())
+                    rows_scored = int(len(out_rows))
+                    positive_rate = (predicted_positive / rows_scored) if rows_scored else None
+
+                    resp: Dict[str, Any] = {
+                        "input": {
+                            "container": in_container,
+                            "prefix": chosen_prefix_norm,
+                            "raw_root_prefix": _normalize_prefix(raw_root),
+                            "blobs_used": int(blobs_used),
+                            "rows_loaded": rows_loaded,
+                            "rows_scored": rows_scored,
+                            "max_blobs": max_blobs,
+                        },
+                        "model": {
+                            "meta": model_meta,
+                            "features": FEATURES,
+                            "encoding": {"MAP_ABCD": MAP_ABCD, "MAP_SHIFT": MAP_SHIFT},
+                            "threshold": threshold,
+                        },
+                        "predictions": {
+                            "predicted_positive": predicted_positive,
+                            "positive_rate": positive_rate,
+                            "prob_min": float(y_prob_s.min()) if rows_scored else None,
+                            "prob_mean": float(y_prob_s.mean()) if rows_scored else None,
+                            "prob_max": float(y_prob_s.max()) if rows_scored else None,
+                            "prob_quantiles": prob_quantiles,
+                            "prob_hist_0p05": prob_hist,
+                            "top_risk_rows": top_rows,
+                        },
+                        "output": {
+                            "container": out_container,
+                            "blob": out_blob,
+                            "latest": latest_blob,
+                        },
+                        "timing": {
+                            "elapsed_sec": round(time.time() - t0, 4),
+                            "scored_at_utc": scored_at,
+                        },
+                    }
+
+                    # Optional: eval if class exists and valid
+                    if LABEL in out_rows.columns:
+                        try:
+                            y_true = pd.to_numeric(out_rows[LABEL], errors="coerce").astype("Int64")
+                            if y_true.notna().all():
+                                y_true_i = y_true.astype(int)
+
+                                report = classification_report(
+                                    y_true_i,
+                                    y_pred,
+                                    output_dict=True,
+                                    zero_division=0,
+                                )
+                                auc = roc_auc_score(y_true_i, y_prob)
+
+                                # confusion matrix: [[tn, fp],[fn, tp]]
+                                tn, fp, fn, tp = confusion_matrix(y_true_i, y_pred, labels=[0, 1]).ravel()
+
+                                base_rate = float((y_true_i == 1).mean()) if rows_scored else None
+
+                                resp["eval"] = {
+                                    "roc_auc": float(auc),
+                                    "accuracy": float(report["accuracy"]),
+                                    "base_rate_true_positive": base_rate,
+                                    "confusion": {
+                                        "tp": int(tp),
+                                        "fp": int(fp),
+                                        "tn": int(tn),
+                                        "fn": int(fn),
+                                    },
+                                    "positive_class_1": {
+                                        "precision": float(report["1"]["precision"]),
+                                        "recall": float(report["1"]["recall"]),
+                                        "f1": float(report["1"]["f1-score"]),
+                                        "support": int(report["1"]["support"]),
+                                    },
+                                    "macro_avg_f1": float(report["macro avg"]["f1-score"]),
+                                    "weighted_avg_f1": float(report["weighted avg"]["f1-score"]),
+                                }
+                        except Exception as e:
+                            resp["eval_error"] = str(e)
+
             except Exception as e:
                 resp["eval_error"] = str(e)
 
